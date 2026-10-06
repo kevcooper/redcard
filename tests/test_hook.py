@@ -68,7 +68,7 @@ class HookTest(unittest.TestCase):
         decision, _ = self.bash("cat .env && rm -rf ~")
         self.assertEqual(decision, "deny")
 
-    def test_other_events_ignored(self):
+    def test_builtin_rules_ignore_post_tool_use(self):
         proc = subprocess.run(
             [sys.executable, str(SCRIPT), "hook"],
             input=json.dumps({"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "rm -rf /"}}),
@@ -190,7 +190,8 @@ class HookTest(unittest.TestCase):
             env=self.env,
         )
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("RED CARD", proc.stdout)
+        self.assertIn("deny: Refusing to force push", proc.stdout)
+        self.assertIn('"permissionDecision": "deny"', proc.stdout)
 
 
 if __name__ == "__main__":

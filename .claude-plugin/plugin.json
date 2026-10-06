@@ -1,9 +1,17 @@
 {
   "name": "redcard",
-  "version": "0.1.0",
-  "description": "Enforce your own OPA (Rego) policies on Claude Code tool calls: red card to block, yellow card to require approval.",
-  "author": { "name": "Kevin Cooper" },
+  "version": "0.2.0",
+  "description": "Run every Claude Code hook event through your own OPA (Rego) policies: block, require approval, approve, keep Claude working, add context, and more.",
+  "author": {
+    "name": "Kevin Cooper"
+  },
   "repository": "https://github.com/kevcooper/redcard",
   "license": "MIT",
-  "keywords": ["opa", "rego", "policy", "hooks", "security"]
+  "keywords": [
+    "opa",
+    "rego",
+    "policy",
+    "hooks",
+    "security"
+  ]
 }

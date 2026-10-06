@@ -107,3 +107,20 @@ test_other_tool_allowed if {
 	count(deny_ids(tool_call)) == 0
 	count(ask_ids(tool_call)) == 0
 }
+
+# Built-in rules only judge tool calls that are about to run.
+
+test_post_tool_use_ignored if {
+	tool_call := {"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "rm -rf /"}}
+	count(deny_ids(tool_call)) == 0
+	count(ask_ids(tool_call)) == 0
+}
+
+test_permission_request_ignored if {
+	tool_call := {"hook_event_name": "PermissionRequest", "tool_name": "Read", "tool_input": {"file_path": "/repo/.env"}}
+	count(ask_ids(tool_call)) == 0
+}
+
+test_explicit_pre_tool_use_denied if {
+	"builtin.rm-root" in deny_ids({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "rm -rf /"}})
+}

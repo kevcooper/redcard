@@ -1,14 +1,9 @@
 # redcard
 
-A Claude Code plugin that runs every tool call through your own
-[OPA](https://www.openpolicyagent.org/) policies before it executes.
-
-- **Red card** (`deny`): the call is blocked, and Claude is told why.
-- **Yellow card** (`ask`): you have to approve the call, even in modes that would otherwise
-  auto-approve it.
-- **Play on**: no policy matched, so Claude Code's normal permissions apply.
-
-Policies can only tighten what Claude may do. They can't approve anything on their own.
+A Claude Code plugin that runs every [hook event](https://code.claude.com/docs/en/hooks)
+through your own [OPA](https://www.openpolicyagent.org/) policies. Rego decides what
+happens: block a tool call or a prompt, require approval, auto-approve, keep Claude working
+instead of stopping, add context, show a message, or return any other hook output.
 
 ## Requirements
 
@@ -31,6 +26,136 @@ Then start a new session. Check the setup from your terminal:
 python3 ~/.claude/plugins/cache/kevcooper/redcard/*/scripts/redcard.py status
 ```
 
+## How decisions work
+
+Policies are Rego files in `package redcard`. They add entries to these sets, and redcard
+turns them into the right output for the event being evaluated:
+
+| Set | Meaning |
+| --- | --- |
+| `deny` | Red card: block whatever the event is about |
+| `ask` | Yellow card: make the user approve |
+| `allow` | Approve without asking |
+| `context` | Text added to Claude's context |
+| `message` | A message shown to the user |
+| `output` | Raw hook output objects, merged in, for anything the sets above don't cover |
+
+`deny` beats `ask`, and `ask` beats `allow`. Entries are strings or `{"id": ..., "msg": ...}`
+objects. An id lets you disable the rule and shows up in the reason.
+
+What `deny`, `ask`, `allow` and `context` do depends on the event:
+
+| Event | `deny` | `ask` | `allow` | `context` |
+| --- | --- | --- | --- | --- |
+| `PreToolUse` | block the tool call | prompt the user | approve the call | yes |
+| `PermissionRequest` | answer the prompt with no | show the prompt (drops any approval) | answer yes | |
+| `PreModelSwitch` | cancel the model switch | prompt the user | approve | |
+| `UserPromptSubmit`, `UserPromptExpansion` | reject the prompt | | | yes |
+| `PostToolUse`, `PostToolUseFailure`, `PostToolBatch` | stop with the reason as feedback | | | yes |
+| `Stop`, `SubagentStop` | keep working, with the reason as the next instruction | | | `Stop` only |
+| `TaskCreated`, `TaskCompleted`, `PreCompact`, `ConfigChange` | block it | | | |
+| `TeammateIdle` | halt the teammate | | | |
+| `Elicitation`, `ElicitationResult` | decline | | | |
+| `SessionStart`, `SubagentStart`, `StopFailure`, `PostCompact`, `PostModelSwitch` | | | | yes |
+
+`message` works on every event. Every other event (`Notification`, `SessionEnd`, `Setup`,
+`PermissionDenied`, `InstructionsLoaded`, `CwdChanged`, `FileChanged`, `DirectoryAdded`)
+can only observe, show a `message`, or return event-specific fields through `output` (for
+example `watchPaths`, `terminalSequence` or `retry`). A set that has no effect on an event
+is ignored, with a note on stderr.
+
+`output` entries are merged into the hook's JSON before the sets are applied, so a `deny`
+always overrides an `output` that tries to approve something. `hookEventName` is filled in
+for you. Use it for things like `updatedInput`, `updatedToolOutput`, `sessionTitle`,
+`displayContent` or an elicitation `action` with `content`.
+
+### Events that aren't hooked
+
+- `WorktreeCreate` and `WorktreeRemove`: a command hook on these replaces Claude Code's own
+  `git worktree` handling, so registering them would break worktrees.
+- `MessageDisplay` is registered but skipped unless you set `"message_display": true`. It
+  fires for every chunk of streamed text, and each check costs about 25 ms when skipped
+  and 80 ms when evaluated.
+
+## Writing policies
+
+Put `.rego` files in either directory:
+
+| Directory | Trust | Applies to |
+| --- | --- | --- |
+| `~/.claude/redcard/policies/` | full | You, in every project |
+| `<project>/.claude/redcard/policies/` | tighten only | Everyone working in that repo (commit it) |
+
+Project policies are evaluated separately and may only tighten: their `allow` and `output`
+entries are ignored, so a repo you clone can't approve tool calls, answer permission
+prompts, or rewrite tool input or output. Their `deny`, `ask`, `context` and `message`
+entries apply.
+
+```rego
+package redcard
+
+import rego.v1
+
+# Red card on a Bash command.
+deny contains {"id": "project.no-prod-db", "msg": "Don't connect to the production database."} if {
+	some seg in segments
+	"prod-db.internal" in tokens(seg)
+}
+
+# Reject a prompt.
+deny contains "Deploys go through CI, not chat." if {
+	event == "UserPromptSubmit"
+	regex.match(`(?i)\bdeploy\b.*\bprod`, input.prompt)
+}
+
+# Keep working until the tests have been run. stop_hook_active is true after a Stop
+# hook already blocked once, so this can't loop.
+deny contains "Run the test suite before finishing." if {
+	event == "Stop"
+	not input.stop_hook_active
+}
+
+# Context at the start of every session.
+context contains "This repo uses pnpm, not npm." if event == "SessionStart"
+
+# Approve read-only git commands without a prompt (user policies only).
+allow contains "Read-only git." if {
+	some seg in segments
+	toks := tokens(seg)
+	program(toks) == "git"
+	toks[1] in {"status", "diff", "log"}
+}
+```
+
+`input` is the hook event's input (`hook_event_name`, `session_id`, `cwd`,
+`permission_mode`, and the event's own fields such as `tool_name`, `tool_input`, `prompt`
+or `stop_hook_active`) plus `input.redcard.project_dir` and `input.redcard.home`.
+
+[policies/lib/helpers.rego](policies/lib/helpers.rego) is always loaded and provides:
+
+- `event`: the hook event name
+- `pre_tool_use`: true for a tool call about to run. PostToolUse, PermissionRequest and
+  others carry `tool_name` and `tool_input` too, so check this in tool rules.
+- `segments`, `tokens(seg)` and `program(toks)`: split a Bash command (only defined for
+  PreToolUse Bash calls)
+
+[examples/policies](examples/policies) has project policies to copy, and the plugin's
+`write-policy` skill can write and test rules for you.
+
+Test a policy without involving Claude:
+
+```
+redcard.py check --bash 'terraform apply'
+redcard.py check --tool Write --input '{"file_path": "/etc/hosts"}'
+redcard.py check --event UserPromptSubmit --input '{"prompt": "deploy to prod"}'
+redcard.py check --event Stop --input '{"stop_hook_active": false}'
+```
+
+`check` prints each set's entries and the exact hook output redcard would return.
+
+Policies run with OPA's network builtins (`http.send`, `net.lookup_ip_addr`) removed, so a
+policy can't send your prompts or tool inputs anywhere.
+
 ## Built-in rules
 
 | Id | Card | Catches |
@@ -42,49 +167,9 @@ python3 ~/.claude/plugins/cache/kevcooper/redcard/*/scripts/redcard.py status
 | `builtin.pipe-to-shell` | yellow | `curl ... \| sh` and similar |
 | `builtin.secret-files` | yellow | Reading or editing `.env*` (not `.env.example`), SSH keys, `*.pem`, `*.key`, `.aws/credentials`, `.kube/config`, `.netrc` |
 
-These match command text with simple tokenizing. They catch common mistakes, not a
-determined attempt to get around them (for example, a command wrapped in `bash -c`).
-
-## Writing policies
-
-Put `.rego` files in either directory:
-
-| Directory | Applies to |
-| --- | --- |
-| `~/.claude/redcard/policies/` | You, in every project |
-| `<project>/.claude/redcard/policies/` | Everyone working in that repo (commit it) |
-
-A policy is `package redcard` and adds entries to `deny` or `ask`:
-
-```rego
-package redcard
-
-import rego.v1
-
-deny contains {"id": "project.no-prod-db", "msg": "Don't connect to the production database."} if {
-	input.tool_name == "Bash"
-	contains(input.tool_input.command, "prod-db.internal")
-}
-```
-
-`input` is the [PreToolUse hook input](https://code.claude.com/docs/en/hooks)
-(`tool_name`, `tool_input`, `cwd`, `permission_mode`, ...) plus `input.redcard.project_dir`
-and `input.redcard.home`. Shared helpers for Bash commands (`segments`, `tokens`, `program`)
-are in [policies/lib/helpers.rego](policies/lib/helpers.rego), and
-[examples/policies](examples/policies) has project policies to copy: keep edits inside the
-project, block manual deploys, and require approval for new dependencies and GitHub writes.
-
-The plugin includes a `write-policy` skill, so you can also just ask Claude to write a rule.
-
-Test a policy without involving Claude:
-
-```
-redcard.py check --bash 'terraform apply'
-redcard.py check --tool Write --input '{"file_path": "/etc/hosts"}'
-```
-
-Policies run with OPA's network builtins (`http.send`, `net.lookup_ip_addr`) removed, so a
-policy can't send your tool inputs anywhere.
+All of them apply to PreToolUse only. They match command text with simple tokenizing, so
+they catch common mistakes, not a determined attempt to get around them (for example, a
+command wrapped in `bash -c`).
 
 ## Configuration
 
@@ -96,7 +181,8 @@ Optional, in `~/.claude/redcard/config.json`:
   "builtin": true,
   "on_error": "ask",
   "opa": "/opt/homebrew/bin/opa",
-  "policy_paths": ["~/src/team-policies"]
+  "policy_paths": ["~/src/team-policies"],
+  "message_display": false
 }
 ```
 
@@ -104,25 +190,41 @@ Optional, in `~/.claude/redcard/config.json`:
 | --- | --- | --- |
 | `disabled` | `[]` | Rule ids to ignore |
 | `builtin` | `true` | Load the built-in rules (the helpers always load) |
-| `on_error` | `"ask"` | What to do when policies can't be evaluated (OPA missing, a policy doesn't compile): `ask`, `deny` or `allow` |
+| `on_error` | `"ask"` | What to do when policies can't be evaluated: `ask`, `deny` or `allow` (see below) |
 | `opa` | `opa` on PATH | Path to the OPA binary |
-| `policy_paths` | `[]` | More policy directories or files to load |
+| `policy_paths` | `[]` | More policy directories or files to load, with full trust |
+| `message_display` | `false` | Evaluate `MessageDisplay` events |
 
-This file is only read from your home directory. A project can add policies but can't
-disable rules or change `on_error`, so a repo you clone can't turn redcard off.
+This file is only read from your home directory. A project can't disable rules or change
+these settings.
 
 Environment variables `REDCARD_OPA`, `REDCARD_ON_ERROR` and `REDCARD_HOME` (default
 `~/.claude/redcard`) override the matching settings.
 
+### When policies can't be evaluated
+
+OPA missing, a policy that doesn't compile, or bad hook input never lets something through
+silently, because Claude Code carries on when a hook crashes. Instead:
+
+| `on_error` | Effect |
+| --- | --- |
+| `ask` | Tool calls and model switches ask for approval. A warning is shown at session start and on each prompt. |
+| `deny` | Events that gate an action (tool calls, permission requests, prompts, model switches, task creation, compaction, config changes, elicitations) are blocked. Stop, PostToolUse and similar events are left alone, since blocking them on an error would loop or end the turn. |
+| `allow` | Nothing is blocked. The error goes to stderr. |
+
+## Performance
+
+Each evaluated event costs roughly 80 ms. A tool call fires PreToolUse, PostToolUse and
+PostToolBatch, and sometimes PermissionRequest, so expect around 250 ms per tool call. A
+project with its own policy directory adds a second OPA run, in parallel.
+
 ## How it works
 
-`hooks/hooks.json` registers `scripts/redcard.py` as a PreToolUse hook for every tool. For
-each call it runs `opa eval` on the hook input against the helpers, built-in rules, your
-policies and the project's policies, and returns a `deny` or `ask` permission decision when
-any rule matches. Each call adds roughly 50 to 100 ms.
-
-Claude Code lets a tool call through if a hook crashes, so redcard turns every failure into
-the `on_error` decision instead.
+`hooks/hooks.json` registers `scripts/redcard.py` for every hook event except the worktree
+events. For each event it runs `opa eval` on the input against the helpers, built-in rules
+and your policies, and separately against the project's policies, then combines the
+results into the event's hook output. When nothing matches it prints nothing and Claude
+Code behaves as if redcard weren't there.
 
 ## Development
 

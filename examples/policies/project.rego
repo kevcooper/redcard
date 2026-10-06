@@ -8,6 +8,7 @@ deny contains {
 	"id": "project.write-outside",
 	"msg": sprintf("%s is outside the project. Only edit files under %s.", [path, input.redcard.project_dir]),
 } if {
+	pre_tool_use
 	input.tool_name in {"Edit", "MultiEdit", "Write", "NotebookEdit"}
 	path := object.get(input.tool_input, "file_path", object.get(input.tool_input, "notebook_path", ""))
 	not startswith(path, concat("", [input.redcard.project_dir, "/"]))
@@ -43,6 +44,7 @@ ask contains {
 	"id": "project.github-write",
 	"msg": sprintf("%s changes GitHub.", [input.tool_name]),
 } if {
+	pre_tool_use
 	startswith(input.tool_name, "mcp__github__")
 	regex.match(`__(create|update|delete|merge|push|add)_`, input.tool_name)
 }
