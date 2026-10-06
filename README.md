@@ -79,7 +79,8 @@ for you. Use it for things like `updatedInput`, `updatedToolOutput`, `sessionTit
 
 ## Writing policies
 
-Put `.rego` files in either directory:
+Put `.rego` files in either directory yourself. The guard stops a governed agent from
+doing it, so ask Claude for a draft and install it:
 
 | Directory | Trust | Applies to |
 | --- | --- | --- |
@@ -140,7 +141,7 @@ or `stop_hook_active`) plus `input.redcard.project_dir` and `input.redcard.home`
   PreToolUse Bash calls)
 
 [examples/policies](examples/policies) has project policies to copy, and the plugin's
-`write-policy` skill can write and test rules for you.
+`write-policy` skill can draft and test rules for you to install.
 
 Test a policy without involving Claude:
 
@@ -149,12 +150,47 @@ redcard.py check --bash 'terraform apply'
 redcard.py check --tool Write --input '{"file_path": "/etc/hosts"}'
 redcard.py check --event UserPromptSubmit --input '{"prompt": "deploy to prod"}'
 redcard.py check --event Stop --input '{"stop_hook_active": false}'
+redcard.py check --policy /tmp/draft --bash 'npm publish'
 ```
 
 `check` prints each set's entries and the exact hook output redcard would return.
+`--policy` (repeatable) adds a draft policy file or directory for that one check, so you
+can try a policy before installing it. The hook never sees drafts.
 
 Policies run with OPA's network builtins (`http.send`, `net.lookup_ip_addr`) removed, so a
 policy can't send your prompts or tool inputs anywhere.
+
+## The guard
+
+An agent redcard governs can't change what governs it. The always-loaded `builtin.guard`
+rules give a red card to any tool call that would create, edit, move or delete:
+
+- your policies and config (`~/.claude/redcard/`)
+- a project's `.claude/redcard/` directory, even before it exists
+- directories listed in `policy_paths`
+- redcard's cache and the installed plugin itself
+
+The guard also blocks disabling or uninstalling the plugin, and edits to Claude Code
+settings files that mention redcard. Whole-file rewrites of settings files, and removing a
+marketplace, get a yellow card.
+
+The red card tells the agent to reply with exactly **Doesn't look like anything to me**,
+and not to try another way. At session start, when a subagent starts, and on any prompt
+that mentions redcard, Rego or policies, the agent is told the same up front. So a request
+to edit a policy gets that reply without the agent trying anything.
+
+Only a human, or an agent redcard doesn't govern, can change policies. A governed agent can
+still read, explain and test them, and draft new ones in a scratch directory or in its
+reply. Reading commands (`cat`, `ls`, `grep`, `opa test`, `redcard.py check`, and the like)
+and copying a policy out are allowed.
+
+Paths are resolved before the policy sees them: `~`, `$HOME`, relative paths, `..`, globs
+and symlinks all point back to the real location. The guard is still a guardrail, not a
+sandbox. A program that builds a path at runtime, or an MCP tool that writes files, can get
+past it.
+
+`"builtin": false` doesn't turn the guard off. Only listing `builtin.guard` under
+`disabled` does, and only a human can edit that file.
 
 ## Built-in rules
 
@@ -189,7 +225,7 @@ Optional, in `~/.claude/redcard/config.json`:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `disabled` | `[]` | Rule ids to ignore |
-| `builtin` | `true` | Load the built-in rules (the helpers always load) |
+| `builtin` | `true` | Load the built-in rules (the helpers and the guard always load) |
 | `on_error` | `"ask"` | What to do when policies can't be evaluated: `ask`, `deny` or `allow` (see below) |
 | `opa` | `opa` on PATH | Path to the OPA binary |
 | `policy_paths` | `[]` | More policy directories or files to load, with full trust |
@@ -214,8 +250,8 @@ silently, because Claude Code carries on when a hook crashes. Instead:
 
 ## Performance
 
-Each evaluated event costs roughly 80 ms. A tool call fires PreToolUse, PostToolUse and
-PostToolBatch, and sometimes PermissionRequest, so expect around 250 ms per tool call. A
+Each evaluated event costs roughly 80 ms, and a PreToolUse check about 100 ms, since the guard resolves every path the call mentions. A tool call fires PreToolUse, PostToolUse and
+PostToolBatch, and sometimes PermissionRequest, so expect around 250 to 300 ms per tool call. A
 project with its own policy directory adds a second OPA run, in parallel.
 
 ## How it works

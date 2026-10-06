@@ -54,13 +54,19 @@ if __name__ == "__main__" and sys.argv[1:] == ["hook"]:
             sys.exit(0)
 
 import argparse
+import glob
 import hashlib
+import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 POLICY_LIB = PLUGIN_ROOT / "policies" / "lib"
+# Rules that keep a governed agent from changing redcard itself. Always loaded,
+# even with "builtin": false; only the user config's "disabled" turns them off.
+GUARD_RULES = PLUGIN_ROOT / "policies" / "guard"
 BUILTIN_RULES = PLUGIN_ROOT / "policies" / "rules"
 QUERY = "data.redcard"
 OPA_TIMEOUT_SECONDS = 8
@@ -154,7 +160,7 @@ def project_dir(event: dict) -> str | None:
 
 def trusted_paths(config: dict) -> list[Path]:
     """Helpers, built-in rules, the user's policies and configured policy paths."""
-    paths = [POLICY_LIB]
+    paths = [POLICY_LIB, GUARD_RULES]
     if config.get("builtin", True):
         paths.append(BUILTIN_RULES)
     user_dir = redcard_home() / "policies"
@@ -409,14 +415,108 @@ def empty_verdict() -> dict:
     return v
 
 
-def decide(event: dict) -> tuple[dict, dict | None]:
-    """Return (verdict, hook output) for a hook event."""
+# --- paths ---------------------------------------------------------------------------
+
+MAX_PATHS = 500
+
+
+def protected_paths(config: dict, project: str | None) -> list[str]:
+    """Everything that controls what redcard enforces: policies, config, cache and the plugin."""
+    roots = [redcard_home(), PLUGIN_ROOT, cache_dir()]
+    if os.environ.get("CLAUDE_PLUGIN_DATA"):
+        roots.append(Path(os.environ["CLAUDE_PLUGIN_DATA"]))
+    if project:
+        # Protected even before it exists, so it can't be created.
+        roots.append(Path(project) / ".claude" / "redcard")
+    roots += [Path(os.path.expanduser(str(p))) for p in config.get("policy_paths", [])]
+    out = set()
+    for root in roots:
+        out.add(os.path.normpath(os.path.abspath(str(root))))
+        out.add(os.path.realpath(str(root)))
+    return sorted(out)
+
+
+def protected_spellings(protected: list[str]) -> list[str]:
+    """Ways a protected path can appear in command text: as is, or with ~ or $HOME for the home dir."""
+    home = str(Path.home())
+    out = set(protected)
+    for path in protected:
+        if path.startswith(home + "/"):
+            rest = path[len(home):]
+            out.update({"~" + rest, "$HOME" + rest, "${HOME}" + rest})
+    return sorted(out)
+
+
+def bash_words(command: str) -> list[str]:
+    """Words of a Bash command, split the way shlex and the Rego helpers both would."""
+    words = []
+    try:
+        words += shlex.split(command, posix=True)
+    except ValueError:
+        pass
+    # The Rego tokens(): split on ; && || | and newlines, then whitespace, quotes removed.
+    for seg in re.split(r";|&&|\|\||\||\n", command):
+        words += [re.sub(r"[\"']", "", w) for w in seg.split()]
+    out = []
+    for word in words:
+        for part in re.split(r"[;&|()]", word):
+            part = re.sub(r"^\d*[<>]+&?", "", part)
+            if not part or part.startswith("-") and "=" not in part:
+                continue
+            out.append(part)
+            if "=" in part:
+                out.append(part.split("=", 1)[1])
+    return list(dict.fromkeys(out))
+
+
+def resolve(word: str, cwd: str) -> list[str]:
+    """A word as absolute paths: ~ and $VARS expanded, made absolute, globs and symlinks resolved."""
+    path = os.path.expandvars(os.path.expanduser(word))
+    if not os.path.isabs(path):
+        path = os.path.join(cwd, path)
+    paths = {os.path.normpath(path)}
+    if any(c in path for c in "*?["):
+        paths.update(os.path.normpath(m) for m in glob.glob(path)[:50])
+    paths.update({os.path.realpath(p) for p in paths})
+    return sorted(paths)
+
+
+def tool_paths(event: dict) -> dict:
+    """For a tool call about to run: the paths it refers to, per word and in total."""
+    info: dict = {"paths": [], "resolved": {}, "cwd": None}
+    if event_name_of(event) != "PreToolUse":
+        return info
+    tool_input = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
+    cwd = str(event.get("cwd") or os.getcwd())
+    words = [str(tool_input[k]) for k in ("file_path", "notebook_path", "path") if tool_input.get(k)]
+    if event.get("tool_name") == "Bash":
+        words += bash_words(str(tool_input.get("command", "")))
+        info["cwd"] = os.path.realpath(cwd)
+    resolved = {word: resolve(word, cwd) for word in words[:MAX_PATHS]}
+    info["resolved"] = resolved
+    info["paths"] = sorted({p for paths in resolved.values() for p in paths})
+    return info
+
+
+def decide(event: dict, extra_policies: list[Path] | None = None) -> tuple[dict, dict | None]:
+    """Return (verdict, hook output) for a hook event.
+
+    extra_policies are draft policy paths evaluated with full trust, for `check --policy`.
+    The hook never passes any.
+    """
     config = load_config()
     project = project_dir(event)
     opa = find_opa(config)
+    protected = protected_paths(config, project)
     opa_input = dict(event)
-    opa_input["redcard"] = {"project_dir": project, "home": str(Path.home())}
-    path_sets = [trusted_paths(config)]
+    opa_input["redcard"] = {
+        "project_dir": project,
+        "home": str(Path.home()),
+        "protected": protected,
+        "protected_spellings": protected_spellings(protected),
+        **tool_paths(event),
+    }
+    path_sets = [trusted_paths(config) + list(extra_policies or [])]
     project_policies = project_policy_dir(project)
     if project_policies:
         path_sets.append([POLICY_LIB, project_policies])
@@ -484,7 +584,11 @@ def cmd_check(args) -> int:
     event.setdefault("hook_event_name", "PreToolUse")
     event.setdefault("cwd", os.getcwd())
     try:
-        v, output = decide(event)
+        drafts = [Path(p).expanduser() for p in args.policy]
+        missing = [str(p) for p in drafts if not p.exists()]
+        if missing:
+            raise RedcardError(f"--policy path does not exist: {', '.join(missing)}")
+        v, output = decide(event, drafts)
     except RedcardError as e:
         v, output = empty_verdict(), error_output(event_name_of(event), e)
         print(f"error: {e}", file=sys.stderr)
@@ -525,8 +629,13 @@ def cmd_status() -> int:
     print("policies (trusted):")
     for path in paths:
         print(f"  {path}")
-    project = project_policy_dir(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    project_root = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    project = project_policy_dir(project_root)
     print(f"policies (project, tighten only): {project or '(none)'}")
+    guard = "off (builtin.guard disabled)" if "builtin.guard" in config.get("disabled", []) else "on"
+    print(f"guard:    {guard}, protecting:")
+    for path in protected_paths(config, project_root):
+        print(f"  {path}")
     return 0
 
 
@@ -539,6 +648,9 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("--tool", help="tool name, for example Read or Write")
     check.add_argument("--event", help="hook event name, for example UserPromptSubmit or Stop")
     check.add_argument("--input", help="tool_input as JSON with --tool, or event fields as JSON with --event")
+    check.add_argument(
+        "--policy", action="append", default=[], help="a draft policy file or directory to include (repeatable)"
+    )
     sub.add_parser("status", help="show OPA, config and policy paths")
     args = parser.parse_args(argv)
     if args.command == "check":
