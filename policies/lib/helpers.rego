@@ -4,9 +4,24 @@ package redcard
 
 import rego.v1
 
+# --- Event helpers -----------------------------------------------------------
+
+# The hook event being evaluated, for example "PreToolUse", "UserPromptSubmit"
+# or "Stop". A missing name is treated as PreToolUse.
+event := object.get(input, "hook_event_name", "PreToolUse")
+
+# True for a tool call that is about to run. Tool rules should check this:
+# PostToolUse, PostToolUseFailure, PermissionRequest and PermissionDenied
+# carry a tool_name and tool_input too.
+pre_tool_use if event == "PreToolUse"
+
 # --- Bash command helpers ----------------------------------------------------
 
-bash_command := input.tool_input.command if input.tool_name == "Bash"
+# The command of a Bash call that is about to run.
+bash_command := input.tool_input.command if {
+	pre_tool_use
+	input.tool_name == "Bash"
+}
 
 # Each simple command in the Bash string, split on ; && || | and newlines.
 segments contains trim_space(seg) if {

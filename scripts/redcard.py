@@ -1,33 +1,62 @@
 #!/usr/bin/env python3
-"""redcard: enforce OPA policies on Claude Code tool calls.
+"""redcard: enforce OPA policies on Claude Code hook events.
 
-Runs as a PreToolUse hook. The hook input is evaluated with `opa eval`
-against the built-in, user and project policies. Any `deny` entry blocks the
-tool call (red card); otherwise any `ask` entry makes the user approve it
-(yellow card); otherwise redcard stays out of the way.
+Registered for every hook event (see hooks/hooks.json). Each event's input is
+evaluated with `opa eval` against `data.redcard`, and the sets policies add to
+are turned into that event's hook output:
 
-Policies can only tighten what Claude may do. Settings that loosen
-enforcement (disabling rules, on_error, turning off the built-ins) are read
-only from the user config, never from a project, so a cloned repo cannot
-switch redcard off.
+  deny     red card: block whatever the event is about (a tool call, a prompt,
+           a permission request, stopping, ...)
+  ask      yellow card: make the user approve (PreToolUse, PreModelSwitch)
+  allow    approve without asking (PreToolUse, PreModelSwitch, PermissionRequest)
+  context  text added to Claude's context (events that support additionalContext)
+  message  a message shown to the user (systemMessage)
+  output   raw hook output objects, merged in, for anything else
+
+deny beats ask, and ask beats allow.
+
+Project policies (<project>/.claude/redcard/policies) are evaluated separately
+and may only tighten: their allow and output entries are ignored, so a cloned
+repo can't approve tool calls or rewrite hook output. Settings that loosen
+enforcement are read only from the user config.
 
 Usage:
   redcard.py hook                     read a hook event on stdin (used by hooks.json)
   redcard.py check --bash 'CMD'       show what redcard decides for a Bash command
   redcard.py check --tool Read --input '{"file_path": "/x/.env"}'
+  redcard.py check --event UserPromptSubmit --input '{"prompt": "deploy prod"}'
   redcard.py check < event.json       evaluate a full hook event
   redcard.py status                   show the OPA binary, config and policy paths
 """
 
 from __future__ import annotations
 
-import argparse
-import hashlib
 import json
 import os
+import sys
+
+# MessageDisplay fires for every chunk of streamed text and is opt-in, so skip
+# it before importing anything else. The input is kept for cmd_hook.
+STDIN = None
+if __name__ == "__main__" and sys.argv[1:] == ["hook"]:
+    STDIN = sys.stdin.read()
+    if '"MessageDisplay"' in STDIN:
+        try:
+            _skip = json.loads(STDIN).get("hook_event_name") == "MessageDisplay"
+            if _skip:
+                _home = os.environ.get("REDCARD_HOME") or os.path.join(os.path.expanduser("~"), ".claude", "redcard")
+                if os.path.isfile(os.path.join(_home, "config.json")):
+                    with open(os.path.join(_home, "config.json")) as _f:
+                        _skip = not json.load(_f).get("message_display")
+        except Exception:  # noqa: BLE001
+            _skip = False  # let the full path below report the problem
+        if _skip:
+            sys.exit(0)
+
+import argparse
+import hashlib
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -36,8 +65,58 @@ BUILTIN_RULES = PLUGIN_ROOT / "policies" / "rules"
 QUERY = "data.redcard"
 OPA_TIMEOUT_SECONDS = 8
 ON_ERROR_CHOICES = ("ask", "deny", "allow")
-# Builtins removed from OPA so policies can't send tool inputs off the machine.
+# Builtins removed from OPA so policies can't send hook inputs off the machine.
 NETWORK_BUILTINS = {"http.send", "net.lookup_ip_addr"}
+VERDICT_SETS = ("deny", "ask", "allow", "context", "message")
+
+# How each policy set maps onto Claude Code's hook output, per event.
+# hookSpecificOutput.permissionDecision: deny / ask / allow.
+PERMISSION_EVENTS = {"PreToolUse", "PreModelSwitch"}
+# Top-level decision "block" with a reason.
+BLOCK_EVENTS = {
+    "UserPromptSubmit",
+    "UserPromptExpansion",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PostToolBatch",
+    "Stop",
+    "SubagentStop",
+    "TaskCreated",
+    "TaskCompleted",
+    "PreCompact",
+    "ConfigChange",
+}
+# hookSpecificOutput.action "decline".
+ELICITATION_EVENTS = {"Elicitation", "ElicitationResult"}
+# hookSpecificOutput.additionalContext.
+CONTEXT_EVENTS = {
+    "PreToolUse",
+    "SessionStart",
+    "UserPromptSubmit",
+    "UserPromptExpansion",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PostToolBatch",
+    "Stop",
+    "StopFailure",
+    "SubagentStart",
+    "PostCompact",
+    "PostModelSwitch",
+}
+# Events where blocking stops something from happening. on_error "deny" blocks
+# only these; blocking Stop, PostToolUse and the like on an error would trap
+# Claude in a loop or end its turn instead of protecting anything.
+GATE_EVENTS = PERMISSION_EVENTS | ELICITATION_EVENTS | {
+    "PermissionRequest",
+    "UserPromptSubmit",
+    "UserPromptExpansion",
+    "TaskCreated",
+    "PreCompact",
+    "ConfigChange",
+}
+# Events where an evaluation error is shown to the user, so a broken setup is
+# noticed without a warning on every tool call.
+WARN_EVENTS = {"SessionStart", "UserPromptSubmit"}
 
 
 class RedcardError(Exception):
@@ -73,7 +152,8 @@ def project_dir(event: dict) -> str | None:
     return os.environ.get("CLAUDE_PROJECT_DIR") or event.get("cwd")
 
 
-def policy_paths(config: dict, project: str | None) -> list[Path]:
+def trusted_paths(config: dict) -> list[Path]:
+    """Helpers, built-in rules, the user's policies and configured policy paths."""
     paths = [POLICY_LIB]
     if config.get("builtin", True):
         paths.append(BUILTIN_RULES)
@@ -85,11 +165,14 @@ def policy_paths(config: dict, project: str | None) -> list[Path]:
         if not path.exists():
             raise RedcardError(f"policy path {path} from config.json does not exist")
         paths.append(path)
-    if project:
-        project_policies = Path(project) / ".claude" / "redcard" / "policies"
-        if project_policies.is_dir():
-            paths.append(project_policies)
     return paths
+
+
+def project_policy_dir(project: str | None) -> Path | None:
+    if not project:
+        return None
+    path = Path(project) / ".claude" / "redcard" / "policies"
+    return path if path.is_dir() else None
 
 
 # --- OPA ---------------------------------------------------------------------------
@@ -117,9 +200,9 @@ def capabilities_file(opa: str) -> Path:
     path = cache_dir() / f"capabilities-{key}.json"
     if path.is_file():
         return path
-    out = run_opa([opa, "capabilities", "--current"])
+    proc = run([opa, "capabilities", "--current"])
     try:
-        caps = json.loads(out)
+        caps = json.loads(proc.stdout)
     except ValueError as e:
         raise RedcardError(f"unexpected output from opa capabilities: {e}") from e
     caps["builtins"] = [b for b in caps.get("builtins", []) if b.get("name") not in NETWORK_BUILTINS]
@@ -131,32 +214,63 @@ def capabilities_file(opa: str) -> Path:
     return path
 
 
-def run_opa(cmd: list[str], stdin: str | None = None) -> str:
+def run(cmd: list[str]) -> subprocess.CompletedProcess:
     try:
-        proc = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=OPA_TIMEOUT_SECONDS)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=OPA_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired as e:
         raise RedcardError(f"OPA took longer than {OPA_TIMEOUT_SECONDS}s") from e
     except OSError as e:
         raise RedcardError(f"can't run OPA: {e}") from e
-    if proc.returncode != 0 and not proc.stdout.strip():
+    if proc.returncode != 0:
         raise RedcardError(f"OPA exited {proc.returncode}: {proc.stderr.strip()}")
-    return proc.stdout
+    return proc
 
 
-def evaluate(opa: str, paths: list[Path], opa_input: dict) -> dict:
-    cmd = [opa, "eval", "--format", "json", "--stdin-input", "--capabilities", str(capabilities_file(opa))]
-    cmd += ["--ignore", "*_test.rego"]
+def eval_command(opa: str, caps: Path, paths: list[Path]) -> list[str]:
+    cmd = [opa, "eval", "--format", "json", "--stdin-input", "--capabilities", str(caps), "--ignore", "*_test.rego"]
     for path in paths:
         cmd += ["--data", str(path)]
     cmd.append(QUERY)
-    out = run_opa(cmd, json.dumps(opa_input))
+    return cmd
+
+
+def evaluate(opa: str, path_sets: list[list[Path]], opa_input: dict) -> list[dict]:
+    """Evaluate each policy set against the same input, in parallel."""
+    caps = capabilities_file(opa)
+    stdin = json.dumps(opa_input)
+    procs = []
+    try:
+        for paths in path_sets:
+            proc = subprocess.Popen(
+                eval_command(opa, caps, paths),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            procs.append(proc)
+        outputs = [proc.communicate(stdin, timeout=OPA_TIMEOUT_SECONDS) for proc in procs]
+    except subprocess.TimeoutExpired as e:
+        raise RedcardError(f"OPA took longer than {OPA_TIMEOUT_SECONDS}s") from e
+    except OSError as e:
+        raise RedcardError(f"can't run OPA: {e}") from e
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+    return [parse_eval(proc.returncode, out, err) for proc, (out, err) in zip(procs, outputs)]
+
+
+def parse_eval(returncode: int, out: str, err: str) -> dict:
+    if returncode != 0 and not out.strip():
+        raise RedcardError(f"OPA exited {returncode}: {err.strip()}")
     try:
         result = json.loads(out)
     except ValueError as e:
         raise RedcardError(f"unexpected output from opa eval: {e}") from e
     # opa eval exits 0 even when policies fail to compile; errors come back in the JSON.
     if result.get("errors"):
-        messages = "; ".join(err.get("message", str(err)) for err in result["errors"])
+        messages = "; ".join(e.get("message", str(e)) for e in result["errors"])
         raise RedcardError(f"policy error: {messages}")
     rows = result.get("result") or []
     if not rows:
@@ -165,11 +279,11 @@ def evaluate(opa: str, paths: list[Path], opa_input: dict) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-# --- decisions -------------------------------------------------------------------------
+# --- verdicts ------------------------------------------------------------------------
 
 
 def entries(value, disabled: set[str]) -> list[str]:
-    """Normalize deny/ask entries to messages, dropping disabled rule ids."""
+    """Normalize a policy set to messages, dropping disabled rule ids."""
     if value is None or value is False:
         return []
     if not isinstance(value, list):
@@ -180,71 +294,179 @@ def entries(value, disabled: set[str]) -> list[str]:
             rule_id = entry.get("id")
             if rule_id in disabled:
                 continue
-            msg = str(entry.get("msg") or "blocked by policy")
+            msg = str(entry.get("msg") or "matched a policy")
             messages.append(f"{msg} [{rule_id}]" if rule_id else msg)
         elif entry is True:
-            messages.append("blocked by policy")
+            messages.append("matched a policy")
         else:
             messages.append(str(entry))
     return sorted(set(messages))
 
 
-def decide(event: dict) -> tuple[str | None, str]:
-    """Return (decision, reason). decision is "deny", "ask" or None."""
+def outputs(value) -> list[dict]:
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, dict)]
+    return []
+
+
+def verdict(value: dict, disabled: set[str], trusted: bool) -> dict:
+    v = {name: entries(value.get(name), disabled) for name in VERDICT_SETS}
+    v["output"] = outputs(value.get("output"))
+    if not trusted:
+        dropped = [name for name in ("allow", "output") if v[name]]
+        if dropped:
+            print(f"redcard: ignored {' and '.join(dropped)} from project policies", file=sys.stderr)
+        v["allow"], v["output"] = [], []
+    return v
+
+
+def combine(verdicts: list[dict]) -> dict:
+    out = {name: [] for name in VERDICT_SETS}
+    out["output"] = []
+    for v in verdicts:
+        for name in VERDICT_SETS:
+            out[name] = sorted(set(out[name]) | set(v[name]))
+        out["output"] += v["output"]
+    return out
+
+
+def deep_merge(base: dict, extra: dict) -> dict:
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def build_output(event_name: str, v: dict, reasons: dict | None = None) -> dict | None:
+    """Turn a verdict into the hook output for event_name, or None for no output."""
+    reasons = reasons or {}
+    out: dict = {}
+    for raw in v["output"]:
+        deep_merge(out, json.loads(json.dumps(raw)))
+    hso = out.pop("hookSpecificOutput", None)
+    hso = hso if isinstance(hso, dict) else {}
+    ignored = []
+
+    if v["deny"]:
+        reason = reasons.get("deny") or "Red card from redcard: " + " ".join(v["deny"])
+        if event_name in PERMISSION_EVENTS:
+            hso.update(permissionDecision="deny", permissionDecisionReason=reason)
+        elif event_name == "PermissionRequest":
+            hso["decision"] = {"behavior": "deny", "message": reason}
+        elif event_name in BLOCK_EVENTS:
+            out.update(decision="block", reason=reason)
+        elif event_name == "TeammateIdle":
+            out.update({"continue": False, "stopReason": reason})
+        elif event_name in ELICITATION_EVENTS:
+            hso["action"] = "decline"
+            hso.pop("content", None)
+        else:
+            ignored.append("deny")
+    elif v["ask"]:
+        reason = reasons.get("ask") or "Yellow card from redcard: " + " ".join(v["ask"])
+        if event_name in PERMISSION_EVENTS:
+            hso.update(permissionDecision="ask", permissionDecisionReason=reason)
+        elif event_name == "PermissionRequest":
+            # Asking is what happens without a decision, so drop any approval.
+            hso.pop("decision", None)
+        else:
+            ignored.append("ask")
+    elif v["allow"]:
+        reason = "Approved by redcard: " + " ".join(v["allow"])
+        if event_name in PERMISSION_EVENTS:
+            hso.update(permissionDecision="allow", permissionDecisionReason=reason)
+        elif event_name == "PermissionRequest":
+            hso["decision"] = {"behavior": "allow"}
+        else:
+            ignored.append("allow")
+
+    if v["context"]:
+        if event_name in CONTEXT_EVENTS:
+            existing = hso.get("additionalContext")
+            hso["additionalContext"] = "\n\n".join(([existing] if existing else []) + v["context"])
+        else:
+            ignored.append("context")
+
+    if v["message"]:
+        existing = out.get("systemMessage")
+        out["systemMessage"] = "\n".join(([existing] if existing else []) + v["message"])
+
+    if ignored:
+        print(f"redcard: {', '.join(ignored)} has no effect on {event_name} events", file=sys.stderr)
+    if hso:
+        hso["hookEventName"] = event_name
+        out["hookSpecificOutput"] = hso
+    return out or None
+
+
+def empty_verdict() -> dict:
+    v = {name: [] for name in VERDICT_SETS}
+    v["output"] = []
+    return v
+
+
+def decide(event: dict) -> tuple[dict, dict | None]:
+    """Return (verdict, hook output) for a hook event."""
     config = load_config()
     project = project_dir(event)
     opa = find_opa(config)
     opa_input = dict(event)
     opa_input["redcard"] = {"project_dir": project, "home": str(Path.home())}
-    value = evaluate(opa, policy_paths(config, project), opa_input)
+    path_sets = [trusted_paths(config)]
+    project_policies = project_policy_dir(project)
+    if project_policies:
+        path_sets.append([POLICY_LIB, project_policies])
+    values = evaluate(opa, path_sets, opa_input)
     disabled = {str(x) for x in config.get("disabled", [])}
-    deny = entries(value.get("deny"), disabled)
-    if deny:
-        return "deny", "Red card from redcard: " + " ".join(deny)
-    ask = entries(value.get("ask"), disabled)
-    if ask:
-        return "ask", "Yellow card from redcard: " + " ".join(ask)
-    return None, ""
+    v = combine([verdict(value, disabled, trusted=(i == 0)) for i, value in enumerate(values)])
+    return v, build_output(event_name_of(event), v)
 
 
-def error_decision(error: Exception) -> tuple[str | None, str]:
+def error_output(event_name: str, error: Exception) -> dict | None:
     try:
         mode = on_error_mode(load_config())
     except RedcardError:
         mode = on_error_mode({})
-    reason = f"redcard could not check this tool call ({error})."
-    if mode == "allow":
-        return None, reason
-    return mode, reason
+    reason = f"redcard could not check this ({error})."
+    print(reason, file=sys.stderr)
+    v = empty_verdict()
+    if mode == "deny" and event_name in GATE_EVENTS:
+        v["deny"] = [reason]
+    elif mode == "deny" or mode == "ask":
+        if event_name in PERMISSION_EVENTS:
+            v["ask"] = [reason]
+        if event_name in WARN_EVENTS:
+            v["message"] = [reason]
+    return build_output(event_name, v, {"deny": reason, "ask": reason})
 
 
-def hook_output(decision: str, reason: str) -> dict:
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": decision,
-            "permissionDecisionReason": reason,
-        }
-    }
+def event_name_of(event: dict) -> str:
+    return str(event.get("hook_event_name") or "PreToolUse")
 
 
 # --- commands ----------------------------------------------------------------------------
 
 
 def cmd_hook() -> int:
-    # Claude Code lets a tool call through when a hook exits nonzero, so every
-    # failure here must become a decision instead of an exception.
+    # Claude Code carries on when a hook exits nonzero, so every failure here
+    # must become an output instead of an exception.
+    event_name = "PreToolUse"
     try:
-        event = json.loads(sys.stdin.read() or "{}")
-        if event.get("hook_event_name", "PreToolUse") != "PreToolUse":
+        event = json.loads((sys.stdin.read() if STDIN is None else STDIN) or "{}")
+        if not isinstance(event, dict):
+            raise RedcardError("hook input is not a JSON object")
+        event_name = event_name_of(event)
+        if event_name == "MessageDisplay" and not load_config().get("message_display"):
             return 0
-        decision, reason = decide(event)
+        _, output = decide(event)
     except Exception as e:  # noqa: BLE001
-        decision, reason = error_decision(e)
-        if decision is None:
-            print(reason, file=sys.stderr)
-    if decision:
-        print(json.dumps(hook_output(decision, reason)))
+        output = error_output(event_name, e)
+    if output:
+        print(json.dumps(output))
     return 0
 
 
@@ -253,19 +475,31 @@ def cmd_check(args) -> int:
         event = {"tool_name": "Bash", "tool_input": {"command": args.bash}}
     elif args.tool:
         event = {"tool_name": args.tool, "tool_input": json.loads(args.input or "{}")}
+    elif args.event and args.input:
+        event = json.loads(args.input)
     else:
         event = json.loads(sys.stdin.read() or "{}")
+    if args.event:
+        event["hook_event_name"] = args.event
     event.setdefault("hook_event_name", "PreToolUse")
     event.setdefault("cwd", os.getcwd())
     try:
-        decision, reason = decide(event)
+        v, output = decide(event)
     except RedcardError as e:
-        decision, reason = error_decision(e)
+        v, output = empty_verdict(), error_output(event_name_of(event), e)
         print(f"error: {e}", file=sys.stderr)
-    print({"deny": "RED CARD (deny)", "ask": "YELLOW CARD (ask)"}.get(decision, "play on (no policy matched)"))
-    if reason:
-        print(reason)
-    return {"deny": 2, "ask": 1}.get(decision, 0)
+    print(f"event: {event['hook_event_name']}")
+    for name in VERDICT_SETS:
+        for msg in v[name]:
+            print(f"{name}: {msg}")
+    if v["output"]:
+        print(f"output: {json.dumps(v['output'])}")
+    print(f"hook output: {json.dumps(output) if output else '(none, Claude Code carries on as normal)'}")
+    if v["deny"]:
+        return 2
+    if v["ask"]:
+        return 1
+    return 0
 
 
 def cmd_status() -> int:
@@ -274,21 +508,25 @@ def cmd_status() -> int:
     except RedcardError as e:
         print(f"config: {e}")
         return 1
-    print(f"config:   {redcard_home() / 'config.json'}{'' if (redcard_home() / 'config.json').is_file() else ' (not present)'}")
+    config_path = redcard_home() / "config.json"
+    print(f"config:   {config_path}{'' if config_path.is_file() else ' (not present)'}")
     try:
         print(f"opa:      {find_opa(config)}")
     except RedcardError as e:
         print(f"opa:      {e}")
     print(f"on_error: {on_error_mode(config)}")
     print(f"disabled: {', '.join(config.get('disabled', [])) or '(none)'}")
+    print(f"message_display: {'on' if config.get('message_display') else 'off'}")
     try:
-        paths = policy_paths(config, os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+        paths = trusted_paths(config)
     except RedcardError as e:
         print(f"policies: {e}")
         return 1
-    print("policies:")
+    print("policies (trusted):")
     for path in paths:
         print(f"  {path}")
+    project = project_policy_dir(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    print(f"policies (project, tighten only): {project or '(none)'}")
     return 0
 
 
@@ -296,10 +534,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="redcard", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("hook", help="evaluate a hook event from stdin (used by hooks.json)")
-    check = sub.add_parser("check", help="show the decision for a tool call")
-    check.add_argument("--bash", help="a Bash command to check")
+    check = sub.add_parser("check", help="show the decision for a hook event")
+    check.add_argument("--bash", help="a Bash command to check (a PreToolUse event)")
     check.add_argument("--tool", help="tool name, for example Read or Write")
-    check.add_argument("--input", help="tool_input as JSON, used with --tool")
+    check.add_argument("--event", help="hook event name, for example UserPromptSubmit or Stop")
+    check.add_argument("--input", help="tool_input as JSON with --tool, or event fields as JSON with --event")
     sub.add_parser("status", help="show OPA, config and policy paths")
     args = parser.parse_args(argv)
     if args.command == "check":

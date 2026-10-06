@@ -176,6 +176,7 @@ ask contains {
 	"id": "builtin.secret-files",
 	"msg": sprintf("%s looks like a credentials or key file.", [path]),
 } if {
+	pre_tool_use
 	input.tool_name in file_tools
 	path := object.get(input.tool_input, "file_path", object.get(input.tool_input, "notebook_path", ""))
 	secret_path(path)
