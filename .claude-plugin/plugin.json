@@ -1,6 +1,6 @@
 {
   "name": "redcard",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Run every Claude Code hook event through your own OPA (Rego) policies: block, require approval, approve, keep Claude working, add context, and more.",
   "author": {
     "name": "Kevin Cooper"

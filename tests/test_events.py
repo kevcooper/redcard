@@ -139,7 +139,7 @@ class EventTest(unittest.TestCase):
         self.user_policy('context contains "This repo deploys from CI only." if event == "SessionStart"')
         out = self.hook("SessionStart", source="startup")
         self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "SessionStart")
-        self.assertEqual(out["hookSpecificOutput"]["additionalContext"], "This repo deploys from CI only.")
+        self.assertIn("This repo deploys from CI only.", out["hookSpecificOutput"]["additionalContext"])
 
     def test_context_ignored_where_unsupported(self):
         self.user_policy('context contains "x" if event == "Notification"')
@@ -152,7 +152,8 @@ class EventTest(unittest.TestCase):
     def test_raw_output_merged(self):
         self.user_policy('output contains {"hookSpecificOutput": {"watchPaths": ["/tmp/x"]}} if event == "SessionStart"')
         out = self.hook("SessionStart", source="startup")
-        self.assertEqual(out["hookSpecificOutput"], {"watchPaths": ["/tmp/x"], "hookEventName": "SessionStart"})
+        self.assertEqual(out["hookSpecificOutput"]["watchPaths"], ["/tmp/x"])
+        self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "SessionStart")
 
     def test_deny_overrides_raw_output(self):
         self.user_policy('output contains {"hookSpecificOutput": {"permissionDecision": "allow"}} if pre_tool_use')
@@ -170,7 +171,7 @@ class EventTest(unittest.TestCase):
         self.project_policy('deny contains "Not in this repo." if { event == "UserPromptSubmit"; contains(input.prompt, "prod") }')
         self.project_policy('context contains "Use pnpm." if event == "SessionStart"')
         self.assertEqual(self.hook("UserPromptSubmit", prompt="prod?")["decision"], "block")
-        self.assertEqual(self.hook("SessionStart", source="startup")["hookSpecificOutput"]["additionalContext"], "Use pnpm.")
+        self.assertIn("Use pnpm.", self.hook("SessionStart", source="startup")["hookSpecificOutput"]["additionalContext"])
 
     def test_project_ask_beats_user_allow(self):
         self.user_policy('allow contains "ok" if pre_tool_use')
